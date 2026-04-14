@@ -3,54 +3,121 @@ import logging
 import os
 import aiosqlite
 import datetime
-import re
 from dotenv import load_dotenv
 
+import aiohttp
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramAPIError
 
-# --- КОНФИГУРАЦИЯ ---
+# ──────────────────────────────────────────────────────────────
+# Прокси и Сессия
+# ──────────────────────────────────────────────────────────────
+try:
+    from aiohttp_socks import ProxyConnector
+    _SOCKS_OK = True
+except ImportError:
+    _SOCKS_OK = False
+
+class _CustomProxySession(AiohttpSession):
+    """Кастомная сессия с SOCKS5-прокси."""
+    def __init__(self, connector: aiohttp.BaseConnector):
+        super().__init__()
+        self._connector = connector
+
+    async def create_session(self) -> aiohttp.ClientSession:
+        return aiohttp.ClientSession(
+            connector=self._connector,
+            json_serialize=self.json_dumps,
+            timeout=aiohttp.ClientTimeout(total=40, connect=15),
+        )
+
+def _make_session() -> AiohttpSession:
+    proxy_url = os.getenv("TG_PROXY_URL", "").strip()
+    timeout = aiohttp.ClientTimeout(total=40, connect=15)
+    
+    if not proxy_url or not _SOCKS_OK:
+        if proxy_url and not _SOCKS_OK:
+            logging.warning("aiohttp-socks не установлен, прокси отключён")
+        return AiohttpSession(timeout=timeout)
+    try:
+        clean = proxy_url.replace("socks5h://", "socks5://")
+        connector = ProxyConnector.from_url(clean, rdns=True)
+        return _CustomProxySession(connector)
+    except Exception as e:
+        logging.error("Ошибка прокси: %s", e)
+        return AiohttpSession(timeout=timeout)
+
+
+# ──────────────────────────────────────────────────────────────
+# Конфигурация Бота
+# ──────────────────────────────────────────────────────────────
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8321504283:AAGfklTup3WR-FaccLQuIs1ST4Knrqd_hVY")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", -1002752721634))
 OWNER_ID = int(os.getenv("OWNER_ID", 6160978171))
 
 if not BOT_TOKEN:
-    exit("Ошибка: BOT_TOKEN не найден в .env")
+    exit("Ошибка: BOT_TOKEN не найден в файле .env")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+bot = Bot(
+    token=BOT_TOKEN, 
+    session=_make_session(), 
+    default=DefaultBotProperties(parse_mode="HTML")
+)
 dp = Dispatcher()
 DB_NAME = "anon_chat.db"
 
-# --- СОСТОЯНИЯ ---
+
 class BroadcastState(StatesGroup):
     waiting_for_message = State()
 
-# --- БАЗА ДАННЫХ ---
+
+# ──────────────────────────────────────────────────────────────
+# База данных
+# ──────────────────────────────────────────────────────────────
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
+                topic_id INTEGER UNIQUE,
                 warns INTEGER DEFAULT 0,
                 is_banned BOOLEAN DEFAULT 0,
                 reg_date TEXT
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                user_msg_id INTEGER,
+                admin_msg_id INTEGER
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_user_msg ON messages(user_msg_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_admin_msg ON messages(admin_msg_id)")
         await db.commit()
 
 async def get_user_by_id(user_id):
     async with aiosqlite.connect(DB_NAME) as db:
-        # Используем Row для обращения по именам колонок
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            return await cursor.fetchone()
+
+async def get_user_by_topic(topic_id):
+    if not topic_id: return None
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM users WHERE topic_id = ?", (topic_id,)) as cursor:
             return await cursor.fetchone()
 
 async def create_user(user_id):
@@ -60,6 +127,11 @@ async def create_user(user_id):
             "INSERT OR IGNORE INTO users (user_id, reg_date) VALUES (?, ?)", 
             (user_id, reg_date)
         )
+        await db.commit()
+
+async def update_user_topic(user_id, topic_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET topic_id = ? WHERE user_id = ?", (topic_id, user_id))
         await db.commit()
 
 async def update_ban(user_id, is_banned):
@@ -85,26 +157,70 @@ async def get_all_users_ids():
         async with db.execute("SELECT user_id FROM users") as c:
             return await c.fetchall()
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-def extract_user_id(text: str):
-    if not text: return None
-    match = re.search(r"ID: (\d+)", text)
-    return int(match.group(1)) if match else None
+# Маппинг сообщений (чтобы знать где чьё сообщение для ответа/редакта)
+async def save_msg_map(user_id, user_msg_id, admin_msg_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT INTO messages (user_id, user_msg_id, admin_msg_id) VALUES (?, ?, ?)",
+            (user_id, user_msg_id, admin_msg_id)
+        )
+        await db.commit()
 
-# --- ХЕНДЛЕРЫ ПОЛЬЗОВАТЕЛЕЙ ---
+async def get_map_by_user_msg(user_msg_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM messages WHERE user_msg_id = ?", (user_msg_id,)) as c:
+            return await c.fetchone()
 
-# Сначала обрабатываем команду Старт
+async def get_map_by_admin_msg(admin_msg_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM messages WHERE admin_msg_id = ?", (admin_msg_id,)) as c:
+            return await c.fetchone()
+
+
+# ──────────────────────────────────────────────────────────────
+# Логика работы с топиками
+# ──────────────────────────────────────────────────────────────
+async def ensure_topic(user_id):
+    user = await get_user_by_id(user_id)
+    if user and user['topic_id']:
+        return user['topic_id']
+    
+    # Создаем новый топик, полностью анонимный
+    try:
+        topic = await bot.create_forum_topic(ADMIN_GROUP_ID, name=f"Анонимный диалог")
+        topic_id = topic.message_thread_id
+        await update_user_topic(user_id, topic_id)
+        
+        # Отправляем шапку только один раз при создании
+        header = (
+            f'<tg-emoji emoji-id="5429226690964374907">⭐️</tg-emoji> <b>Создан новый диалог</b>\n'
+            f'Для информации об авторе используйте команду /info'
+        )
+        await bot.send_message(ADMIN_GROUP_ID, header, message_thread_id=topic_id)
+        return topic_id
+    except Exception as e:
+        logger.error(f"Не удалось создать топик: {e}")
+        return None
+
+
+# ──────────────────────────────────────────────────────────────
+# ХЕНДЛЕРЫ ПОЛЬЗОВАТЕЛЕЙ (ЛС)
+# ──────────────────────────────────────────────────────────────
 @dp.message(F.chat.type == "private", CommandStart())
 async def cmd_start(message: types.Message):
     await create_user(message.from_user.id)
     user = await get_user_by_id(message.from_user.id)
-
     if user and user['is_banned']:
-        return # Ничего не отвечаем забаненным
+        return 
 
     photo_url = "https://i.yapx.ru/dY3rO.png"
     text = (
-        '⊹ ࣪ ˖ || Добро пожаловать в бот поддержки "Шⲩⲙ Кⲟⲥⲙⲟⲥⲁ"!✨ \n━━━━━━━━━━━━━━━━━━━━━━\n📝 Наш бот всегда готов помочь вам:\n• Ответим на ваши вопросы;\n• Поддержим в трудную минуту;\n• Предложим админа для общения если вам просто скучно.\n━━━━━━━━━━━━━━━━━━━━━━\n🔗 Наш канал: @Canal_BotRuEs\n🛠 Тех поддержка: @ApoyoTecnico_RuEsBot\n━━━━━━━━━━━━━━━━━━━━━━\n💌 Прочитайте правила и напишите ваше сообщение, мы обязательно ответим! Учтите, незнание правил не освобождает от ответственности.'
+        '⊹ ࣪ ˖ || Добро пожаловать в бот поддержки "Шⲩⲙ Кⲟⲥⲙⲟⲥⲁ"!✨ \n━━━━━━━━━━━━━━━━━━━━━━\n'
+        '📝 Наш бот всегда готов помочь вам:\n• Ответим на ваши вопросы;\n'
+        '• Поддержим в трудную минуту;\n• Предложим админа для общения если вам просто скучно.\n'
+        '━━━━━━━━━━━━━━━━━━━━━━\n💌 Прочитайте правила и напишите ваше сообщение!'
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -116,14 +232,12 @@ async def cmd_start(message: types.Message):
     try:
         sent_msg = await message.answer_photo(photo=photo_url, caption=text, reply_markup=keyboard)
         await bot.pin_chat_message(chat_id=message.chat.id, message_id=sent_msg.message_id)
-    except Exception as e:
-        logger.error(f"Ошибка в cmd_start: {e}")
+    except Exception:
         await message.answer(text, reply_markup=keyboard)
 
-# Затем обрабатываем все остальные сообщения в ЛС
+
 @dp.message(F.chat.type == "private")
 async def user_message(message: types.Message):
-    # Если это любая другая команда, не обрабатываем её здесь
     if message.text and message.text.startswith("/"):
         return
 
@@ -131,62 +245,167 @@ async def user_message(message: types.Message):
     if not user:
         await create_user(message.from_user.id)
         user = await get_user_by_id(message.from_user.id)
+    if user['is_banned']: return
 
-    if user['is_banned']:
-        return
+    topic_id = await ensure_topic(message.from_user.id)
+    if not topic_id:
+        return await message.answer("Ошибка связи с сервером поддержки.")
 
-    # Заголовок сообщения для админов (важно: кавычки в f-строке)
-    header = (
-        f'<tg-emoji emoji-id="5429226690964374907">⭐️</tg-emoji> <b>Новое сообщение</b>\n'
-        f'<tg-emoji emoji-id="5467538555158943525">💭</tg-emoji> От: {message.from_user.mention_html()}\n'
-        f'<tg-emoji emoji-id="5206607081334906820">✔️</tg-emoji> ID: <code>{message.from_user.id}</code>\n'
-        f'<tg-emoji emoji-id="5447644880824181073">⚠️</tg-emoji> Варнов: {user["warns"]}/3\n'
-        f'--------------------------'
-    )
+    # Проверяем, является ли сообщение ответом
+    reply_to_admin_msg_id = None
+    if message.reply_to_message:
+        msg_map = await get_map_by_user_msg(message.reply_to_message.message_id)
+        if msg_map:
+            reply_to_admin_msg_id = msg_map['admin_msg_id']
 
     try:
-        info_msg = await bot.send_message(ADMIN_GROUP_ID, header)
-        await message.copy_to(chat_id=ADMIN_GROUP_ID, reply_to_message_id=info_msg.message_id)
-
+        sent_msg = await message.copy_to(
+            chat_id=ADMIN_GROUP_ID, 
+            message_thread_id=topic_id, 
+            reply_to_message_id=reply_to_admin_msg_id
+        )
+        await save_msg_map(message.from_user.id, message.message_id, sent_msg.message_id)
+        
         sent_confirm = await message.answer('<tg-emoji emoji-id="5206607081334906820">✔️</tg-emoji> Отправлено!')
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
         await sent_confirm.delete()
     except Exception as e:
         logger.error(f"Ошибка пересылки: {e}")
 
-# --- ХЕНДЛЕРЫ АДМИНОВ ---
+
+# ──────────────────────────────────────────────────────────────
+# ХЕНДЛЕРЫ АДМИНОВ (Топики и команды)
+# ──────────────────────────────────────────────────────────────
+@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("info"))
+async def cmd_info(message: types.Message):
+    user = await get_user_by_topic(message.message_thread_id)
+    if not user:
+        return await message.reply("Это не топик пользователя или он не найден.")
+    
+    info_text = (
+        f"<b>Информация об анониме:</b>\n\n"
+        f"ID: <code>{user['user_id']}</code>\n"
+        f"Предупреждения (Варны): {user['warns']}/3\n"
+        f"Бан: {'Да' if user['is_banned'] else 'Нет'}\n"
+        f"Дата начала: {user['reg_date']}"
+    )
+    await message.reply(info_text)
+
 
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("ban"))
 async def cmd_ban(message: types.Message):
-    if not message.reply_to_message:
-        return await message.reply("Ответьте на сообщение пользователя!")
+    user = await get_user_by_topic(message.message_thread_id)
+    if not user: return await message.reply("Используйте в топике юзера.")
 
-    user_id = extract_user_id(message.reply_to_message.text or message.reply_to_message.caption or "")
-    if not user_id: return
-
-    await update_ban(user_id, True)
-    await message.reply(f'<tg-emoji emoji-id="5240241223632954241">🚫</tg-emoji> Юзер <code>{user_id}</code> <b>ЗАБАНЕН</b>.')
+    await update_ban(user['user_id'], True)
+    await message.reply(f'<tg-emoji emoji-id="5240241223632954241">🚫</tg-emoji> Этот пользователь <b>ЗАБАНЕН</b>.')
     try:
-        await bot.send_message(user_id, '<tg-emoji emoji-id="5240241223632954241">🚫</tg-emoji> Вы заблокированы.')
-    except:
-        pass
+        await bot.send_message(user['user_id'], '<tg-emoji emoji-id="5240241223632954241">🚫</tg-emoji> Вы заблокированы.')
+    except: pass
+
 
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("warn"))
 async def cmd_warn(message: types.Message):
-    if not message.reply_to_message: return
-    user_id = extract_user_id(message.reply_to_message.text or message.reply_to_message.caption or "")
-    if not user_id: return
+    user = await get_user_by_topic(message.message_thread_id)
+    if not user: return await message.reply("Используйте в топике юзера.")
 
-    user = await get_user_by_id(user_id)
     new_warns = user['warns'] + 1
-    await update_warns(user_id, new_warns)
+    await update_warns(user['user_id'], new_warns)
 
     if new_warns >= 3:
-        await update_ban(user_id, True)
-        await message.reply(f'<tg-emoji emoji-id="5240241223632954241">🚫</tg-emoji> 3/3 варна. Юзер <code>{user_id}</code> забанен.')
+        await update_ban(user['user_id'], True)
+        await message.reply(f'<tg-emoji emoji-id="5240241223632954241">🚫</tg-emoji> 3/3 варна. Пользователь забанен.')
     else:
-        await message.reply(f'<tg-emoji emoji-id="5447644880824181073">⚠️</tg-emoji> Варн ({new_warns}/3) для <code>{user_id}</code>')
+        await message.reply(f'<tg-emoji emoji-id="5447644880824181073">⚠️</tg-emoji> Выдан варн ({new_warns}/3)')
 
+
+@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("del"))
+async def cmd_delete_msg(message: types.Message):
+    """Админ-команда для удаления сообщения у юзера."""
+    if not message.reply_to_message: return
+    msg_map = await get_map_by_admin_msg(message.reply_to_message.message_id)
+    if msg_map:
+        try:
+            await bot.delete_message(msg_map['user_id'], msg_map['user_msg_id'])
+            await message.reply_to_message.delete()
+            await message.delete()
+        except TelegramAPIError:
+            await message.reply("Не удалось удалить у пользователя (возможно старое сообщение).")
+
+
+# Ответ админа юзеру (просто сообщение в топик)
+@dp.message(F.chat.id == ADMIN_GROUP_ID)
+async def admin_reply(message: types.Message, state: FSMContext):
+    if message.text and message.text.startswith("/"): return 
+    
+    # Игнорируем сообщения в General (нет топика)
+    if not message.message_thread_id: return 
+
+    user = await get_user_by_topic(message.message_thread_id)
+    if not user: return 
+    if user['is_banned']: 
+        return await message.reply("Пользователь в бане.")
+
+    reply_to_user_msg_id = None
+    if message.reply_to_message:
+        msg_map = await get_map_by_admin_msg(message.reply_to_message.message_id)
+        if msg_map:
+            reply_to_user_msg_id = msg_map['user_msg_id']
+
+    try:
+        sent_msg = await message.copy_to(
+            chat_id=user['user_id'],
+            reply_to_message_id=reply_to_user_msg_id
+        )
+        await save_msg_map(user['user_id'], sent_msg.message_id, message.message_id)
+    except Exception:
+        await message.reply('<tg-emoji emoji-id="5416076321442777828">❌</tg-emoji> Не удалось доставить (возможно бот заблокирован).')
+
+
+# ──────────────────────────────────────────────────────────────
+# РЕДАКТИРОВАНИЕ И РЕАКЦИИ (Синхронизация)
+# ──────────────────────────────────────────────────────────────
+@dp.edited_message()
+async def edit_sync(message: types.Message):
+    if message.chat.type == "private":
+        msg_map = await get_map_by_user_msg(message.message_id)
+        if msg_map:
+            try:
+                if message.text:
+                    await bot.edit_message_text(message.text, ADMIN_GROUP_ID, msg_map['admin_msg_id'], entities=message.entities)
+                elif message.caption:
+                    await bot.edit_message_caption(ADMIN_GROUP_ID, msg_map['admin_msg_id'], caption=message.caption, caption_entities=message.caption_entities)
+            except TelegramAPIError: pass
+    elif message.chat.id == ADMIN_GROUP_ID:
+        msg_map = await get_map_by_admin_msg(message.message_id)
+        if msg_map:
+            try:
+                if message.text:
+                    await bot.edit_message_text(message.text, msg_map['user_id'], msg_map['user_msg_id'], entities=message.entities)
+                elif message.caption:
+                    await bot.edit_message_caption(msg_map['user_id'], msg_map['user_msg_id'], caption=message.caption, caption_entities=message.caption_entities)
+            except TelegramAPIError: pass
+
+
+@dp.message_reaction()
+async def reaction_sync(reaction: types.MessageReactionUpdated):
+    if reaction.chat.type == "private":
+        msg_map = await get_map_by_user_msg(reaction.message_id)
+        if msg_map:
+            try:
+                await bot.set_message_reaction(ADMIN_GROUP_ID, msg_map['admin_msg_id'], reaction.new_reaction)
+            except TelegramAPIError: pass
+    elif reaction.chat.id == ADMIN_GROUP_ID:
+        msg_map = await get_map_by_admin_msg(reaction.message_id)
+        if msg_map:
+            try:
+                await bot.set_message_reaction(msg_map['user_id'], msg_map['user_msg_id'], reaction.new_reaction)
+            except TelegramAPIError: pass
+
+
+# ──────────────────────────────────────────────────────────────
+# СТАТИСТИКА И РАССЫЛКА
+# ──────────────────────────────────────────────────────────────
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("stats"))
 async def cmd_stats(message: types.Message):
     if message.from_user.id != OWNER_ID: return
@@ -217,27 +436,12 @@ async def process_broadcast(message: types.Message, state: FSMContext):
     await message.reply(f'<tg-emoji emoji-id="5206607081334906820">✔️</tg-emoji> Успешно: {good}, Ошибок: {bad}')
     await state.clear()
 
-@dp.message(F.chat.id == ADMIN_GROUP_ID, F.reply_to_message)
-async def admin_reply(message: types.Message):
-    if message.text and message.text.startswith("/"):
-        return 
 
-    target_text = message.reply_to_message.text or message.reply_to_message.caption or ""
-    user_id = extract_user_id(target_text)
-
-    if not user_id:
-        return 
-
-    try:
-        await message.copy_to(chat_id=user_id)
-        await message.react([types.ReactionTypeEmoji(emoji="🕊")])
-    except Exception:
-        await message.reply('<tg-emoji emoji-id="5416076321442777828">❌</tg-emoji> Не удалось доставить.')
-
-# --- ЗАПУСК ---
+# ──────────────────────────────────────────────────────────────
+# ЗАПУСК
+# ──────────────────────────────────────────────────────────────
 async def main():
     await init_db()
-    # Очищаем очередь обновлений, чтобы бот не «захлебнулся» старыми нажатиями Старт
     await bot.delete_webhook(drop_pending_updates=True)
     print("Бот успешно запущен!")
     await dp.start_polling(bot)
