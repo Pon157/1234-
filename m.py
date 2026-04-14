@@ -16,7 +16,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramAPIError
 
 # ──────────────────────────────────────────────────────────────
-# Прокси и Сессия
+# Прокси и Сессия (ФИКС: timeout передаем как float)
 # ──────────────────────────────────────────────────────────────
 try:
     from aiohttp_socks import ProxyConnector
@@ -44,7 +44,7 @@ def _make_session() -> AiohttpSession:
     if not proxy_url or not _SOCKS_OK:
         if proxy_url and not _SOCKS_OK:
             logging.warning("aiohttp-socks не установлен, прокси отключён")
-        return AiohttpSession(timeout=40.0) # Передаем число, а не объект!
+        return AiohttpSession(timeout=40.0) 
     try:
         clean = proxy_url.replace("socks5h://", "socks5://")
         connector = ProxyConnector.from_url(clean, rdns=True)
@@ -75,10 +75,8 @@ bot = Bot(
 dp = Dispatcher()
 DB_NAME = "anon_chat.db"
 
-
 class BroadcastState(StatesGroup):
     waiting_for_message = State()
-
 
 # ──────────────────────────────────────────────────────────────
 # База данных
@@ -110,14 +108,16 @@ async def get_user_by_id(user_id):
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            return await cursor.fetchone()
+            res = await cursor.fetchone()
+            return dict(res) if res else None
 
 async def get_user_by_topic(topic_id):
     if not topic_id: return None
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM users WHERE topic_id = ?", (topic_id,)) as cursor:
-            return await cursor.fetchone()
+            res = await cursor.fetchone()
+            return dict(res) if res else None
 
 async def create_user(user_id):
     reg_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -156,7 +156,6 @@ async def get_all_users_ids():
         async with db.execute("SELECT user_id FROM users") as c:
             return await c.fetchall()
 
-# Маппинг сообщений (чтобы знать где чьё сообщение для ответа/редакта)
 async def save_msg_map(user_id, user_msg_id, admin_msg_id):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
@@ -169,13 +168,15 @@ async def get_map_by_user_msg(user_msg_id):
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM messages WHERE user_msg_id = ?", (user_msg_id,)) as c:
-            return await c.fetchone()
+            res = await c.fetchone()
+            return dict(res) if res else None
 
 async def get_map_by_admin_msg(admin_msg_id):
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM messages WHERE admin_msg_id = ?", (admin_msg_id,)) as c:
-            return await c.fetchone()
+            res = await c.fetchone()
+            return dict(res) if res else None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -183,16 +184,15 @@ async def get_map_by_admin_msg(admin_msg_id):
 # ──────────────────────────────────────────────────────────────
 async def ensure_topic(user_id):
     user = await get_user_by_id(user_id)
-    if user and user['topic_id']:
+    # ФИКС: Безопасное обращение к ключу
+    if user and user.get('topic_id'):
         return user['topic_id']
     
-    # Создаем новый топик, полностью анонимный
     try:
         topic = await bot.create_forum_topic(ADMIN_GROUP_ID, name=f"Анонимный диалог")
         topic_id = topic.message_thread_id
         await update_user_topic(user_id, topic_id)
         
-        # Отправляем шапку только один раз при создании
         header = (
             f'<tg-emoji emoji-id="5429226690964374907">⭐️</tg-emoji> <b>Создан новый диалог</b>\n'
             f'Для информации об авторе используйте команду /info'
@@ -250,7 +250,6 @@ async def user_message(message: types.Message):
     if not topic_id:
         return await message.answer("Ошибка связи с сервером поддержки.")
 
-    # Проверяем, является ли сообщение ответом
     reply_to_admin_msg_id = None
     if message.reply_to_message:
         msg_map = await get_map_by_user_msg(message.reply_to_message.message_id)
@@ -320,7 +319,6 @@ async def cmd_warn(message: types.Message):
 
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("del"))
 async def cmd_delete_msg(message: types.Message):
-    """Админ-команда для удаления сообщения у юзера."""
     if not message.reply_to_message: return
     msg_map = await get_map_by_admin_msg(message.reply_to_message.message_id)
     if msg_map:
@@ -332,12 +330,9 @@ async def cmd_delete_msg(message: types.Message):
             await message.reply("Не удалось удалить у пользователя (возможно старое сообщение).")
 
 
-# Ответ админа юзеру (просто сообщение в топик)
 @dp.message(F.chat.id == ADMIN_GROUP_ID)
 async def admin_reply(message: types.Message, state: FSMContext):
     if message.text and message.text.startswith("/"): return 
-    
-    # Игнорируем сообщения в General (нет топика)
     if not message.message_thread_id: return 
 
     user = await get_user_by_topic(message.message_thread_id)
