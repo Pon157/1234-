@@ -27,7 +27,8 @@ except ImportError:
 class _CustomProxySession(AiohttpSession):
     """Кастомная сессия с SOCKS5-прокси."""
     def __init__(self, connector: aiohttp.BaseConnector):
-        super().__init__()
+        # В aiogram 3.x timeout для сессии ОБЯЗАТЕЛЬНО должен быть числом (float/int)
+        super().__init__(timeout=40.0) 
         self._connector = connector
 
     async def create_session(self) -> aiohttp.ClientSession:
@@ -39,20 +40,18 @@ class _CustomProxySession(AiohttpSession):
 
 def _make_session() -> AiohttpSession:
     proxy_url = os.getenv("TG_PROXY_URL", "").strip()
-    timeout = aiohttp.ClientTimeout(total=40, connect=15)
     
     if not proxy_url or not _SOCKS_OK:
         if proxy_url and not _SOCKS_OK:
             logging.warning("aiohttp-socks не установлен, прокси отключён")
-        return AiohttpSession(timeout=timeout)
+        return AiohttpSession(timeout=40.0) # Передаем число, а не объект!
     try:
         clean = proxy_url.replace("socks5h://", "socks5://")
         connector = ProxyConnector.from_url(clean, rdns=True)
         return _CustomProxySession(connector)
     except Exception as e:
         logging.error("Ошибка прокси: %s", e)
-        return AiohttpSession(timeout=timeout)
-
+        return AiohttpSession(timeout=40.0)
 
 # ──────────────────────────────────────────────────────────────
 # Конфигурация Бота
