@@ -298,7 +298,22 @@ async def cmd_ban(message: types.Message):
     await update_ban(user['user_id'], True)
     await message.reply(f'<tg-emoji emoji-id="5240241223632954241">🚫</tg-emoji> Этот пользователь <b>ЗАБАНЕН</b>.')
     try:
-        await bot.send_message(user['user_id'], '<tg-emoji emoji-id="5240241223632954241">🚫</tg-emoji> Вы заблокированы.')
+        await bot.send_message(user['user_id'], '<tg-emoji emoji-id="5240241223632954241">🚫</tg-emoji> Вы заблокированы администрацией.')
+    except: pass
+
+
+@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("unban"))
+async def cmd_unban(message: types.Message):
+    user = await get_user_by_topic(message.message_thread_id)
+    if not user: return await message.reply("Используйте в топике юзера.")
+
+    await update_ban(user['user_id'], False)
+    # При разбане логично обнулить и варны
+    await update_warns(user['user_id'], 0)
+    
+    await message.reply(f'<tg-emoji emoji-id="5206607081334906820">✔️</tg-emoji> Пользователь <b>РАЗБЛОКИРОВАН</b>, варны обнулены.')
+    try:
+        await bot.send_message(user['user_id'], '<tg-emoji emoji-id="5206607081334906820">✔️</tg-emoji> Вы были разблокированы!')
     except: pass
 
 
@@ -312,14 +327,47 @@ async def cmd_warn(message: types.Message):
 
     if new_warns >= 3:
         await update_ban(user['user_id'], True)
-        await message.reply(f'<tg-emoji emoji-id="5240241223632954241">🚫</tg-emoji> 3/3 варна. Пользователь забанен.')
+        await message.reply(f'<tg-emoji emoji-id="5240241223632954241">🚫</tg-emoji> 3/3 варна. Пользователь автоматически забанен.')
+        try:
+            await bot.send_message(user['user_id'], '🚫 Вы получили 3-е предупреждение и были заблокированы.')
+        except: pass
     else:
         await message.reply(f'<tg-emoji emoji-id="5447644880824181073">⚠️</tg-emoji> Выдан варн ({new_warns}/3)')
+        try:
+            await bot.send_message(user['user_id'], f'⚠️ Вам выдано предупреждение ({new_warns}/3). Будьте вежливы!')
+        except: pass
+
+
+@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("unwarn"))
+async def cmd_unwarn(message: types.Message):
+    user = await get_user_by_topic(message.message_thread_id)
+    if not user: return await message.reply("Используйте в топике юзера.")
+
+    if user['warns'] == 0:
+        return await message.reply("У пользователя 0 варнов.")
+
+    new_warns = user['warns'] - 1
+    await update_warns(user['user_id'], new_warns)
+    
+    # Если забираем варн и их становится меньше 3 — снимаем бан
+    if user['is_banned'] and new_warns < 3:
+        await update_ban(user['user_id'], False)
+        status = "и РАЗБАНЕН"
+    else:
+        status = ""
+
+    await message.reply(f'✅ Варн снят ({new_warns}/3) {status}')
+    try:
+        await bot.send_message(user['user_id'], f'✅ С вас сняли одно предупреждение ({new_warns}/3).')
+    except: pass
 
 
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("del"))
 async def cmd_delete_msg(message: types.Message):
-    if not message.reply_to_message: return
+    """Удаление конкретного сообщения у юзера через ответ на него в топике."""
+    if not message.reply_to_message: 
+        return await message.reply("Ответьте на сообщение, которое нужно удалить.")
+        
     msg_map = await get_map_by_admin_msg(message.reply_to_message.message_id)
     if msg_map:
         try:
@@ -327,18 +375,22 @@ async def cmd_delete_msg(message: types.Message):
             await message.reply_to_message.delete()
             await message.delete()
         except TelegramAPIError:
-            await message.reply("Не удалось удалить у пользователя (возможно старое сообщение).")
+            await message.reply("Не удалось удалить у пользователя (возможно, прошло более 48 часов).")
+    else:
+        await message.reply("Сообщение не найдено в базе данных.")
 
 
 @dp.message(F.chat.id == ADMIN_GROUP_ID)
 async def admin_reply(message: types.Message, state: FSMContext):
+    """Пересылка обычных сообщений из топика пользователю в ЛС."""
     if message.text and message.text.startswith("/"): return 
     if not message.message_thread_id: return 
 
     user = await get_user_by_topic(message.message_thread_id)
     if not user: return 
+    
     if user['is_banned']: 
-        return await message.reply("Пользователь в бане.")
+        return await message.reply("Пользователь заблокирован. Команды: /unban или /unwarn")
 
     reply_to_user_msg_id = None
     if message.reply_to_message:
@@ -351,11 +403,10 @@ async def admin_reply(message: types.Message, state: FSMContext):
             chat_id=user['user_id'],
             reply_to_message_id=reply_to_user_msg_id
         )
+        # Сохраняем маппинг для возможности удаления или ответов в будущем
         await save_msg_map(user['user_id'], sent_msg.message_id, message.message_id)
     except Exception:
-        await message.reply('<tg-emoji emoji-id="5416076321442777828">❌</tg-emoji> Не удалось доставить (возможно бот заблокирован).')
-
-
+        await message.reply('❌ Не удалось доставить сообщение. Возможно, пользователь заблокировал бота.')
 # ──────────────────────────────────────────────────────────────
 # РЕДАКТИРОВАНИЕ И РЕАКЦИИ (Синхронизация)
 # ──────────────────────────────────────────────────────────────
