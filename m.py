@@ -16,7 +16,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramAPIError
 
 # ──────────────────────────────────────────────────────────────
-# Прокси и Сессия (ФИКС: timeout передаем как float)
+# Прокси и Сессия
 # ──────────────────────────────────────────────────────────────
 try:
     from aiohttp_socks import ProxyConnector
@@ -27,7 +27,6 @@ except ImportError:
 class _CustomProxySession(AiohttpSession):
     """Кастомная сессия с SOCKS5-прокси."""
     def __init__(self, connector: aiohttp.BaseConnector):
-        # В aiogram 3.x timeout для сессии ОБЯЗАТЕЛЬНО должен быть числом (float/int)
         super().__init__(timeout=40.0) 
         self._connector = connector
 
@@ -57,9 +56,10 @@ def _make_session() -> AiohttpSession:
 # Конфигурация Бота
 # ──────────────────────────────────────────────────────────────
 load_dotenv()
+# Токен и другие чувствительные данные берем строго из .env
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", -1002752721634))
-OWNER_ID = int(os.getenv("OWNER_ID", 6160978171))
+OWNER_ID = int(os.getenv("OWNER_ID", 6160978171)) # Твой ID стоит по умолчанию
 
 if not BOT_TOKEN:
     exit("Ошибка: BOT_TOKEN не найден в файле .env")
@@ -178,13 +178,11 @@ async def get_map_by_admin_msg(admin_msg_id):
             res = await c.fetchone()
             return dict(res) if res else None
 
-
 # ──────────────────────────────────────────────────────────────
 # Логика работы с топиками
 # ──────────────────────────────────────────────────────────────
 async def ensure_topic(user_id):
     user = await get_user_by_id(user_id)
-    # ФИКС: Безопасное обращение к ключу
     if user and user.get('topic_id'):
         return user['topic_id']
     
@@ -272,8 +270,49 @@ async def user_message(message: types.Message):
 
 
 # ──────────────────────────────────────────────────────────────
-# ХЕНДЛЕРЫ АДМИНОВ (Топики и команды)
+# ХЕНДЛЕРЫ АДМИНОВ (Команды - ДОЛЖНЫ БЫТЬ ВЫШЕ обычных сообщений)
 # ──────────────────────────────────────────────────────────────
+
+@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("stats"))
+async def cmd_stats(message: types.Message):
+    if message.from_user.id != OWNER_ID: 
+        return await message.reply("У вас нет прав для этой команды.")
+    
+    total, banned = await get_stats_data()
+    await message.reply(f'<tg-emoji emoji-id="5467538555158943525">💭</tg-emoji> <b>Статистика</b>\nЮзеров: {total}\nВ бане: {banned}')
+
+
+@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("broadcast"))
+async def cmd_broadcast(message: types.Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID: 
+        return await message.reply("У вас нет прав для этой команды.")
+    
+    await message.reply('Введите текст рассылки (для отмены введите /cancel):')
+    await state.set_state(BroadcastState.waiting_for_message)
+
+
+@dp.message(F.chat.id == ADMIN_GROUP_ID, BroadcastState.waiting_for_message)
+async def process_broadcast(message: types.Message, state: FSMContext):
+    if message.text == "/cancel":
+        await state.clear()
+        return await message.reply("Рассылка отменена.")
+
+    users = await get_all_users_ids()
+    good, bad = 0, 0
+    await message.reply("Начинаю рассылку...")
+    
+    for u in users:
+        try:
+            await message.copy_to(chat_id=u[0])
+            good += 1
+            await asyncio.sleep(0.05) # Защита от флудлимита
+        except Exception:
+            bad += 1
+            
+    await message.reply(f'<tg-emoji emoji-id="5206607081334906820">✔️</tg-emoji> Успешно: {good}, Ошибок: {bad}')
+    await state.clear()
+
+
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("info"))
 async def cmd_info(message: types.Message):
     user = await get_user_by_topic(message.message_thread_id)
@@ -308,7 +347,6 @@ async def cmd_unban(message: types.Message):
     if not user: return await message.reply("Используйте в топике юзера.")
 
     await update_ban(user['user_id'], False)
-    # При разбане логично обнулить и варны
     await update_warns(user['user_id'], 0)
     
     await message.reply(f'<tg-emoji emoji-id="5206607081334906820">✔️</tg-emoji> Пользователь <b>РАЗБЛОКИРОВАН</b>, варны обнулены.')
@@ -349,7 +387,6 @@ async def cmd_unwarn(message: types.Message):
     new_warns = user['warns'] - 1
     await update_warns(user['user_id'], new_warns)
     
-    # Если забираем варн и их становится меньше 3 — снимаем бан
     if user['is_banned'] and new_warns < 3:
         await update_ban(user['user_id'], False)
         status = "и РАЗБАНЕН"
@@ -380,9 +417,14 @@ async def cmd_delete_msg(message: types.Message):
         await message.reply("Сообщение не найдено в базе данных.")
 
 
+# ──────────────────────────────────────────────────────────────
+# ХЕНДЛЕР-ЛОВЕЦ (Обычные ответы админов — должен быть ВНИЗУ)
+# ──────────────────────────────────────────────────────────────
+
 @dp.message(F.chat.id == ADMIN_GROUP_ID)
 async def admin_reply(message: types.Message, state: FSMContext):
     """Пересылка обычных сообщений из топика пользователю в ЛС."""
+    # Защита: если это команда, которую мы не обработали выше (например, опечатка), просто игнорим
     if message.text and message.text.startswith("/"): return 
     if not message.message_thread_id: return 
 
@@ -403,10 +445,11 @@ async def admin_reply(message: types.Message, state: FSMContext):
             chat_id=user['user_id'],
             reply_to_message_id=reply_to_user_msg_id
         )
-        # Сохраняем маппинг для возможности удаления или ответов в будущем
         await save_msg_map(user['user_id'], sent_msg.message_id, message.message_id)
     except Exception:
         await message.reply('❌ Не удалось доставить сообщение. Возможно, пользователь заблокировал бота.')
+
+
 # ──────────────────────────────────────────────────────────────
 # РЕДАКТИРОВАНИЕ И РЕАКЦИИ (Синхронизация)
 # ──────────────────────────────────────────────────────────────
@@ -446,40 +489,6 @@ async def reaction_sync(reaction: types.MessageReactionUpdated):
             try:
                 await bot.set_message_reaction(msg_map['user_id'], msg_map['user_msg_id'], reaction.new_reaction)
             except TelegramAPIError: pass
-
-
-# ──────────────────────────────────────────────────────────────
-# СТАТИСТИКА И РАССЫЛКА
-# ──────────────────────────────────────────────────────────────
-@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("stats"))
-async def cmd_stats(message: types.Message):
-    if message.from_user.id != OWNER_ID: return
-    total, banned = await get_stats_data()
-    await message.reply(f'<tg-emoji emoji-id="5467538555158943525">💭</tg-emoji> <b>Статистика</b>\nЮзеров: {total}\nВ бане: {banned}')
-
-@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("broadcast"))
-async def cmd_broadcast(message: types.Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID: return
-    await message.reply('Введите текст рассылки:')
-    await state.set_state(BroadcastState.waiting_for_message)
-
-@dp.message(F.chat.id == ADMIN_GROUP_ID, BroadcastState.waiting_for_message)
-async def process_broadcast(message: types.Message, state: FSMContext):
-    if message.text == "/cancel":
-        await state.clear()
-        return await message.reply("Отмена.")
-
-    users = await get_all_users_ids()
-    good, bad = 0, 0
-    for u in users:
-        try:
-            await message.copy_to(chat_id=u[0])
-            good += 1
-            await asyncio.sleep(0.05)
-        except:
-            bad += 1
-    await message.reply(f'<tg-emoji emoji-id="5206607081334906820">✔️</tg-emoji> Успешно: {good}, Ошибок: {bad}')
-    await state.clear()
 
 
 # ──────────────────────────────────────────────────────────────
