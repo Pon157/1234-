@@ -16,7 +16,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramAPIError
 
 # ──────────────────────────────────────────────────────────────
-# Прокси и Сессия (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+# Прокси и Сессия
 # ──────────────────────────────────────────────────────────────
 try:
     from aiohttp_socks import ProxyConnector
@@ -77,7 +77,6 @@ if not BOT_TOKEN:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Теперь инициализация безопасна, так как создание коннектора отложено
 bot = Bot(
     token=BOT_TOKEN, 
     session=create_bot_session(), 
@@ -85,6 +84,10 @@ bot = Bot(
 )
 dp = Dispatcher()
 DB_NAME = "anon_chat.db"
+
+# Инициализация состояний для рассылки (ИСПРАВЛЕНИЕ ОШИБКИ)
+class BroadcastState(StatesGroup):
+    waiting_for_message = State()
 
 # ──────────────────────────────────────────────────────────────
 # База данных
