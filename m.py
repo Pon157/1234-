@@ -220,27 +220,51 @@ async def ensure_topic(user_id):
 async def cmd_start(message: types.Message):
     await create_user(message.from_user.id)
     user = await get_user_by_id(message.from_user.id)
+    
     if user and user['is_banned']:
         return 
 
-    photo_url = "https://i.yapx.ru/dY3rO.png"
+    photo_url = "https://i.yapx.ru/dcMB3.png"
+    
+    # Новый текст
     text = (
-        '⊹ ࣪ ˖ || Добро пожаловать в бот поддержки "Шⲩⲙ Кⲟⲥⲙⲟⲥⲁ"!✨ \n━━━━━━━━━━━━━━━━━━━━━━\n'
-        '📝 Наш бот всегда готов помочь вам:\n• Ответим на ваши вопросы;\n'
-        '• Поддержим в трудную минуту;\n• Предложим админа для общения если вам просто скучно.\n'
-        '━━━━━━━━━━━━━━━━━━━━━━\n💌 Прочитайте правила и напишите ваше сообщение!'
+        "<b>Чувствуешь себя подавленным или нуждаешься в дружеской поддержке?</b>\n"
+        "Бот «Невзаимная любовь» всегда рядом! ✨\n\n"
+        "Мы предлагаем круглосуточную помощь, доброе слово и полезные советы. "
+        "Наши администраторы — внимательные и отзывчивые люди, готовые выслушать тебя, "
+        "поддержать и дать совет в любой ситуации. Полная анонимность гарантирована.\n\n"
+        "<b>Мы гарантируем тебе:</b>\n"
+        "• Круглосуточную поддержку\n"
+        "• Понимание и сочувствие\n"
+        "• Общение на любые темы\n"
+        "• Практические советы\n"
+        "• Анонимность\n\n"
+        "Наш бот набирает админов! Если хочешь стать частью команды, напиши в наш бот для анкет: @Otzhvu777_bot\n\n"
+        "<i>Вы можете ориентироваться по кнопкам в меню ниже:</i>"
     )
+
+    # Создаем клавиатуру со всеми 6 кнопками
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Кнопка 1. (ТГК)", url="https://t.me/lota_uy")],
+        [InlineKeyboardButton(text="Кнопка 2. (Проверки)", url="http://t.me/Otzhvu777_bot")],
+        [InlineKeyboardButton(text="Кнопка 3. (Список админов)", url="https://t.me/lota_uy/222")],
         [
-            InlineKeyboardButton(text="Канал", url="https://t.me/Canal_BotRuEs"),
-            InlineKeyboardButton(text="Правила", url="https://t.me/ApoyoTecnico_RuEsBot")
-        ]
+            InlineKeyboardButton(text="Отзывы (Анонимно)", url="http://t.me/Otzhvu777_bot"),
+            InlineKeyboardButton(text="Отзывы (Публично)", url="https://t.me/lota_uy/219")
+        ],
+        [InlineKeyboardButton(text="Кнопка 5. (🟥 Пожаловаться)", url="http://t.me/Otzhvu777_bot")],
+        [InlineKeyboardButton(text="Кнопка 6. (Стать админом)", url="http://t.me/Otzhvu777_bot")]
     ])
 
     try:
-        sent_msg = await message.answer_photo(photo=photo_url, caption=text, reply_markup=keyboard)
+        sent_msg = await message.answer_photo(
+            photo=photo_url, 
+            caption=text, 
+            reply_markup=keyboard
+        )
         await bot.pin_chat_message(chat_id=message.chat.id, message_id=sent_msg.message_id)
-    except Exception:
+    except Exception as e:
+        logger.error(f"Ошибка при отправке старта: {e}")
         await message.answer(text, reply_markup=keyboard)
 
 
