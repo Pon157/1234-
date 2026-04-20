@@ -24,22 +24,25 @@ try:
 except ImportError:
     _SOCKS_OK = False
 
-class _CustomProxySession(AiohttpSession):
-    """Кастомная сессия с SOCKS5-прокси."""
-    def __init__(self, connector: aiohttp.BaseConnector):
-        super().__init__(timeout=40.0) 
-        self._connector = connector
-        self._session = None
+class LazyProxySession(AiohttpSession):
+    """Ленивая сессия с SOCKS5-прокси. Коннектор создается только внутри работающего event loop."""
+    def __init__(self, proxy_url: str):
+        super().__init__(timeout=40.0)
+        self._proxy_url = proxy_url
+        self._connector = None
 
     async def create_session(self) -> aiohttp.ClientSession:
+        # Инициализация происходит уже внутри асинхронного контекста
         if self._session is None or self._session.closed:
+            clean = self._proxy_url.replace("socks5h://", "socks5://")
+            self._connector = ProxyConnector.from_url(clean, rdns=True)
             self._session = aiohttp.ClientSession(
                 connector=self._connector,
                 json_serialize=self.json_dumps,
                 timeout=aiohttp.ClientTimeout(total=40, connect=15),
             )
         return self._session
-    
+
     async def close(self):
         """Закрываем сессию и коннектор"""
         if self._session and not self._session.closed:
@@ -47,39 +50,26 @@ class _CustomProxySession(AiohttpSession):
         if self._connector and hasattr(self._connector, 'close'):
             await self._connector.close()
 
-async def _make_session_async() -> AiohttpSession:
-    """АСИНХРОННОЕ создание сессии с прокси"""
+def create_bot_session() -> AiohttpSession:
+    """Синхронная обертка для создания нужного типа сессии."""
     proxy_url = os.getenv("TG_PROXY_URL", "").strip()
     
     if not proxy_url or not _SOCKS_OK:
         if proxy_url and not _SOCKS_OK:
-            logging.warning("aiohttp-socks не установлен, прокси отключён")
+            logging.warning("aiohttp-socks не установлен, прокси отключён.")
         return AiohttpSession(timeout=40.0)
     
-    try:
-        clean = proxy_url.replace("socks5h://", "socks5://")
-        # Создаем коннектор (это может быть синхронно, но безопасно)
-        connector = ProxyConnector.from_url(clean, rdns=True)
-        session = _CustomProxySession(connector)
-        return session
-    except Exception as e:
-        logging.error("Ошибка прокси: %s", e)
-        return AiohttpSession(timeout=40.0)
-
-# Для обратной совместимости, но лучше не использовать
-def _make_session() -> AiohttpSession:
-    """Синхронная обертка (устарело, используйте _make_session_async)"""
-    logging.warning("Используйте _make_session_async() вместо _make_session()")
-    return AiohttpSession(timeout=40.0)
+    return LazyProxySession(proxy_url)
 
 # ──────────────────────────────────────────────────────────────
 # Конфигурация Бота
 # ──────────────────────────────────────────────────────────────
 load_dotenv()
-# Токен и другие чувствительные данные берем строго из .env
+
+# Токен и другие чувствительные данные берутся строго из .env
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", -1002752721634))
-OWNER_ID = int(os.getenv("OWNER_ID", 6160978171)) # Твой ID стоит по умолчанию
+OWNER_ID = int(os.getenv("OWNER_ID", 6160978171)) 
 
 if not BOT_TOKEN:
     exit("Ошибка: BOT_TOKEN не найден в файле .env")
@@ -87,16 +77,14 @@ if not BOT_TOKEN:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Теперь инициализация безопасна, так как создание коннектора отложено
 bot = Bot(
     token=BOT_TOKEN, 
-    session=_make_session(), 
+    session=create_bot_session(), 
     default=DefaultBotProperties(parse_mode="HTML")
 )
 dp = Dispatcher()
 DB_NAME = "anon_chat.db"
-
-class BroadcastState(StatesGroup):
-    waiting_for_message = State()
 
 # ──────────────────────────────────────────────────────────────
 # База данных
