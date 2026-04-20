@@ -16,7 +16,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramAPIError
 
 # ──────────────────────────────────────────────────────────────
-# Прокси и Сессия
+# Прокси и Сессия (ИСПРАВЛЕННАЯ ВЕРСИЯ)
 # ──────────────────────────────────────────────────────────────
 try:
     from aiohttp_socks import ProxyConnector
@@ -29,28 +29,48 @@ class _CustomProxySession(AiohttpSession):
     def __init__(self, connector: aiohttp.BaseConnector):
         super().__init__(timeout=40.0) 
         self._connector = connector
+        self._session = None
 
     async def create_session(self) -> aiohttp.ClientSession:
-        return aiohttp.ClientSession(
-            connector=self._connector,
-            json_serialize=self.json_dumps,
-            timeout=aiohttp.ClientTimeout(total=40, connect=15),
-        )
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                connector=self._connector,
+                json_serialize=self.json_dumps,
+                timeout=aiohttp.ClientTimeout(total=40, connect=15),
+            )
+        return self._session
+    
+    async def close(self):
+        """Закрываем сессию и коннектор"""
+        if self._session and not self._session.closed:
+            await self._session.close()
+        if self._connector and hasattr(self._connector, 'close'):
+            await self._connector.close()
 
-def _make_session() -> AiohttpSession:
+async def _make_session_async() -> AiohttpSession:
+    """АСИНХРОННОЕ создание сессии с прокси"""
     proxy_url = os.getenv("TG_PROXY_URL", "").strip()
     
     if not proxy_url or not _SOCKS_OK:
         if proxy_url and not _SOCKS_OK:
             logging.warning("aiohttp-socks не установлен, прокси отключён")
-        return AiohttpSession(timeout=40.0) 
+        return AiohttpSession(timeout=40.0)
+    
     try:
         clean = proxy_url.replace("socks5h://", "socks5://")
+        # Создаем коннектор (это может быть синхронно, но безопасно)
         connector = ProxyConnector.from_url(clean, rdns=True)
-        return _CustomProxySession(connector)
+        session = _CustomProxySession(connector)
+        return session
     except Exception as e:
         logging.error("Ошибка прокси: %s", e)
         return AiohttpSession(timeout=40.0)
+
+# Для обратной совместимости, но лучше не использовать
+def _make_session() -> AiohttpSession:
+    """Синхронная обертка (устарело, используйте _make_session_async)"""
+    logging.warning("Используйте _make_session_async() вместо _make_session()")
+    return AiohttpSession(timeout=40.0)
 
 # ──────────────────────────────────────────────────────────────
 # Конфигурация Бота
